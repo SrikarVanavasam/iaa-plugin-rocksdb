@@ -221,6 +221,7 @@ class IAAJob {
     uint32_t size;
     qpl_status status = qpl_get_job_size(execution_path, &size);
     if (status != QPL_STS_OK) {
+      std::cerr << "[IaaCompressor] InitJob: qpl_get_job_size failed for path " << execution_path << " with status " << status << std::endl;
       jobs_[execution_path] = nullptr;
       return;
     }
@@ -237,6 +238,7 @@ class IAAJob {
         uint64_t iova;
         qpl_status reg_status = qpl_cxl_register_buffer(ptr, size, &iova);
         if (reg_status != QPL_STS_OK) {
+          std::cerr << "[IaaCompressor] InitJob: qpl_cxl_register_buffer failed for job buffer with status " << reg_status << std::endl;
           numa_free(ptr, size);
           jobs_[execution_path] = nullptr;
           return;
@@ -251,6 +253,7 @@ class IAAJob {
     }
     status = qpl_init_job(execution_path, jobs_[execution_path]);
     if (status != QPL_STS_OK) {
+      std::cerr << "[IaaCompressor] InitJob: qpl_init_job failed for path " << execution_path << " with status " << status << std::endl;
       if (GetCxlConfig().enabled && execution_path == qpl_path_pool) {
         qpl_cxl_deregister_buffer(jobs_[execution_path]);
         numa_free(jobs_[execution_path], size);
@@ -327,6 +330,7 @@ class IAACompressor : public Compressor {
 
     qpl_job* job = job_.GetJob(execution_path);
     if (job == nullptr) {
+      std::cerr << "[IaaCompressor] Compress: job is nullptr for path " << execution_path << std::endl;
       return Status::Corruption(JOB_INIT_ERROR);
     }
 
@@ -396,10 +400,14 @@ class IAACompressor : public Compressor {
 
     status = QPL_STS_QUEUES_ARE_BUSY_ERR;
     while (status == QPL_STS_QUEUES_ARE_BUSY_ERR) {
-      status = qpl_execute_job(job);
+      status = qpl_submit_job(job);
+    }
+    if (status == QPL_STS_OK) {
+      status = qpl_wait_job(job);
     }
 
     if (status != QPL_STS_OK) {
+      std::cerr << "[IaaCompressor] Compress: qpl_execute_job failed with status " << status << std::endl;
       return Status::Corruption(QPL_STATUS(status));
     }
 
@@ -504,7 +512,10 @@ class IAACompressor : public Compressor {
 
     status = QPL_STS_QUEUES_ARE_BUSY_ERR;
     while (status == QPL_STS_QUEUES_ARE_BUSY_ERR) {
-      status = qpl_execute_job(job);
+      status = qpl_submit_job(job);
+    }
+    if (status == QPL_STS_OK) {
+      status = qpl_wait_job(job);
     }
 
 
