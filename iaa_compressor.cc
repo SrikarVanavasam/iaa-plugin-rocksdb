@@ -31,15 +31,20 @@
 #include "rocksdb/utilities/options_type.h"
 #include "util/coding.h"
 
-namespace ROCKSDB_NAMESPACE {
+extern "C" {
+void* cxl_mempool_alloc(size_t size);
+void cxl_mempool_free(void* ptr);
+uint8_t* cxl_mempool_get_start(void);
+size_t cxl_mempool_get_size(void);
+size_t cxl_mempool_get_sgl_count(void);
+struct CxlSglEntryLocal { void* va; size_t size; };
+void cxl_mempool_get_sgl(CxlSglEntryLocal* out_entries);
+}
 
-typedef uint8_t* (*cxl_get_start_fn)();
-typedef size_t (*cxl_get_size_fn)();
-typedef void* (*cxl_alloc_fn)(size_t);
+namespace ROCKSDB_NAMESPACE {
 
 static uint8_t* g_cxl_pool_start = nullptr;
 static size_t g_cxl_pool_size = 0;
-static cxl_alloc_fn g_cxl_alloc = nullptr;
 
 struct CxlConfig {
   bool enabled = false;
@@ -98,35 +103,19 @@ static CxlConfig& GetCxlConfig() {
       uint8_t* pool_start = nullptr;
       size_t pool_size = 0;
 
-      cxl_get_start_fn get_start = (cxl_get_start_fn)dlsym(RTLD_DEFAULT, "cxl_mempool_get_start");
-      cxl_get_size_fn get_size = (cxl_get_size_fn)dlsym(RTLD_DEFAULT, "cxl_mempool_get_size");
+      g_cxl_pool_start = cxl_mempool_get_start();
+      g_cxl_pool_size = cxl_mempool_get_size();
+      std::cerr << "[IaaCompressor] SGL functions detected! pool_start=" << (void*)g_cxl_pool_start << " pool_size=" << g_cxl_pool_size << std::endl;
 
-      if (get_start && get_size) {
-        pool_start = get_start();
-        pool_size = get_size();
-        g_cxl_pool_start = pool_start;
-        g_cxl_pool_size = pool_size;
-      }
-      
-      g_cxl_alloc = (cxl_alloc_fn)dlsym(RTLD_DEFAULT, "cxl_mempool_alloc");
-
-      if (pool_start && pool_size > 0) {
-        uint64_t iova;
-        qpl_status reg_status = qpl_cxl_register_buffer(pool_start, pool_size, &iova);
-        if (reg_status != QPL_STS_OK) {
-          std::cerr << "[IaaCompressor] WARNING: Failed to pre-register the 1GB mempool! Fast-path will fail." << std::endl;
-        } else {
-          std::cerr << "[IaaCompressor] Successfully pre-registered CXL Mempool (size " << pool_size << ") at IOVA " << std::hex << iova << std::dec << std::endl;
-          std::atexit([]() {
-            cxl_get_start_fn get_start_atexit = (cxl_get_start_fn)dlsym(RTLD_DEFAULT, "cxl_mempool_get_start");
-            if (get_start_atexit) {
-              uint8_t* ptr = get_start_atexit();
-              if (ptr) qpl_cxl_deregister_buffer(ptr);
-            }
-          });
-        }
-      } else {
-        std::cerr << "[IaaCompressor] WARNING: CXL Mempool not detected via LD_PRELOAD. Fast-path registrations will bypass the pool." << std::endl;
+      size_t count = cxl_mempool_get_sgl_count();
+      std::vector<CxlSglEntryLocal> entries(count);
+      cxl_mempool_get_sgl(entries.data());
+      for (size_t i = 0; i < count; ++i) {
+        uint64_t iova = 0;
+        qpl_status reg_st = qpl_cxl_register_buffer(reinterpret_cast<uint8_t*>(entries[i].va), entries[i].size, &iova);
+        std::cerr << "[IaaCompressor] Segment " << i << " va=" << entries[i].va 
+                  << " size=" << entries[i].size << " reg_status=" << reg_st 
+                  << " iova=0x" << std::hex << iova << std::dec << std::endl;
       }
     }
   });
@@ -149,15 +138,64 @@ FactoryFunc<Compressor> iaa_compressor_reg =
           return compressor->get();
         });
 
+class CxlMemoryAllocator : public MemoryAllocator {
+ public:
+  static const char* kClassName() { return "CxlMemoryAllocator"; }
+  const char* Name() const override { return kClassName(); }
+
+  void* Allocate(size_t size) override {
+    return cxl_mempool_alloc(size);
+  }
+
+  void Deallocate(void* p) override {
+    cxl_mempool_free(p);
+  }
+};
+
+extern "C" FactoryFunc<MemoryAllocator> iaa_memory_allocator_reg;
+
+FactoryFunc<MemoryAllocator> iaa_memory_allocator_reg =
+    ObjectLibrary::Default()->AddFactory<MemoryAllocator>(
+        "iaa_memory_allocator",
+        [](const std::string& /* uri */,
+           std::unique_ptr<MemoryAllocator>* allocator, std::string* /* errmsg */) {
+          allocator->reset(new CxlMemoryAllocator());
+          return allocator->get();
+        });
+
 std::unordered_map<std::string, qpl_path_t> execution_paths{
     {"auto", qpl_path_auto},
     {"hw", qpl_path_hardware},
     {"sw", qpl_path_software}};
 
-enum qpl_compression_mode { dynamic_mode, fixed_mode };
+enum qpl_compression_mode { dynamic_mode, fixed_mode, canned_mode };
 
 std::unordered_map<std::string, qpl_compression_mode> compression_modes{
-    {"dynamic", dynamic_mode}, {"fixed", fixed_mode}};
+    {"dynamic", dynamic_mode}, {"fixed", fixed_mode}, {"canned", canned_mode}};
+
+static qpl_huffman_table_t GetGlobalCannedHuffmanTable() {
+  static qpl_huffman_table_t huffman_table = nullptr;
+  static std::once_flag flag;
+  std::call_once(flag, []() {
+    qpl_status status = qpl_deflate_huffman_table_create(combined_table_type, qpl_path_auto, DEFAULT_ALLOCATOR_C, &huffman_table);
+    if (status != QPL_STS_OK) {
+      std::cerr << "[IaaCompressor] Error creating canned Huffman table: " << status << std::endl;
+      return;
+    }
+    qpl_histogram histogram;
+    std::memset(&histogram, 0, sizeof(histogram));
+    for (int i = 0; i < 286; ++i) histogram.literal_lengths[i] = 1;
+    for (int i = 0; i < 30; ++i) histogram.distances[i] = 1;
+    
+    status = qpl_huffman_table_init_with_histogram(huffman_table, &histogram);
+    if (status != QPL_STS_OK) {
+      std::cerr << "[IaaCompressor] Error initializing canned Huffman table: " << status << std::endl;
+    } else {
+      std::cout << "[IaaCompressor] Successfully initialized global canned Huffman table." << std::endl;
+    }
+  });
+  return huffman_table;
+}
 
 struct IAACompressorOptions {
   static const char* kName() { return "IAACompressorOptions"; };
@@ -206,7 +244,7 @@ class IAAJob {
         qpl_fini_job(job);
         if (config.enabled && i == qpl_path_pool) {
           qpl_cxl_deregister_buffer(job);
-          numa_free(job, sizes_[i]);
+          cxl_mempool_free(job);
         } else {
           delete[] reinterpret_cast<char*>(job);
         }
@@ -229,7 +267,7 @@ class IAAJob {
     try {
       auto& config = GetCxlConfig();
       if (config.enabled && execution_path == qpl_path_pool) {
-        void* ptr = numa_alloc_onnode(size, config.numa_node);
+        void* ptr = cxl_mempool_alloc(size);
         if (!ptr) {
           jobs_[execution_path] = nullptr;
           return;
@@ -239,7 +277,7 @@ class IAAJob {
         qpl_status reg_status = qpl_cxl_register_buffer(ptr, size, &iova);
         if (reg_status != QPL_STS_OK) {
           std::cerr << "[IaaCompressor] InitJob: qpl_cxl_register_buffer failed for job buffer with status " << reg_status << std::endl;
-          numa_free(ptr, size);
+          cxl_mempool_free(ptr);
           jobs_[execution_path] = nullptr;
           return;
         }
@@ -253,10 +291,14 @@ class IAAJob {
     }
     status = qpl_init_job(execution_path, jobs_[execution_path]);
     if (status != QPL_STS_OK) {
-      std::cerr << "[IaaCompressor] InitJob: qpl_init_job failed for path " << execution_path << " with status " << status << std::endl;
+      bool should_log = (execution_path == qpl_path_software) || 
+                        (GetCxlConfig().enabled && execution_path == qpl_path_pool);
+      if (should_log) {
+        std::cerr << "[IaaCompressor] InitJob: qpl_init_job failed for path " << execution_path << " with status " << status << std::endl;
+      }
       if (GetCxlConfig().enabled && execution_path == qpl_path_pool) {
         qpl_cxl_deregister_buffer(jobs_[execution_path]);
-        numa_free(jobs_[execution_path], size);
+        cxl_mempool_free(jobs_[execution_path]);
       } else {
         delete[] reinterpret_cast<char*>(jobs_[execution_path]);
       }
@@ -343,32 +385,32 @@ class IAACompressor : public Compressor {
     bool dst_in_pool = g_cxl_pool_start && destination >= g_cxl_pool_start && destination < g_cxl_pool_start + g_cxl_pool_size;
     
     thread_local uint8_t* bounce_src = nullptr;
+    thread_local size_t bounce_src_cap = 0;
     thread_local uint8_t* bounce_dst = nullptr;
+    thread_local size_t bounce_dst_cap = 0;
 
     if (!src_in_pool && config.enabled && execution_path == qpl_path_pool) {
-      if (input.size() > 4096) {
-        std::cerr << "[QPL CXL] WARNING: Compress source buffer bypasses pool and is > 4KB (" << input.size() << " bytes)!" << std::endl;
+      if (input.size() > bounce_src_cap) {
+        size_t new_cap = std::max(input.size() * 2, static_cast<size_t>(65536));
+        bounce_src = (uint8_t*)cxl_mempool_alloc(new_cap);
+        if (bounce_src) bounce_src_cap = new_cap;
       }
-      if (input.size() <= 8192) {
-        if (!bounce_src && g_cxl_alloc) bounce_src = (uint8_t*)g_cxl_alloc(8192);
-        if (bounce_src) {
-          std::memcpy(bounce_src, source, input.size());
-          source = bounce_src;
-        }
+      if (bounce_src) {
+        std::memcpy(bounce_src, source, input.size());
+        source = bounce_src;
       }
     }
 
     size_t avail_out = output_length - output_header_length;
     if (!dst_in_pool && config.enabled && execution_path == qpl_path_pool) {
-      if (avail_out > 4096) {
-        std::cerr << "[QPL CXL] WARNING: Compress destination buffer bypasses pool and is > 4KB (" << avail_out << " bytes)!" << std::endl;
+      if (avail_out > bounce_dst_cap) {
+        size_t new_cap = std::max(avail_out * 2, static_cast<size_t>(65536));
+        bounce_dst = (uint8_t*)cxl_mempool_alloc(new_cap);
+        if (bounce_dst) bounce_dst_cap = new_cap;
       }
-      if (avail_out <= 8192) {
-        if (!bounce_dst && g_cxl_alloc) bounce_dst = (uint8_t*)g_cxl_alloc(8192);
-        if (bounce_dst) {
-          destination = bounce_dst;
-          avail_out = 8192; // Give hardware the full buffer size to avoid QPL_STS_MORE_OUTPUT_NEEDED
-        }
+      if (bounce_dst) {
+        destination = bounce_dst;
+        avail_out = bounce_dst_cap;
       }
     }
 
@@ -387,6 +429,9 @@ class IAACompressor : public Compressor {
 
     if (options_.compression_mode == dynamic_mode) {
       job->flags |= QPL_FLAG_DYNAMIC_HUFFMAN;
+    } else if (options_.compression_mode == canned_mode) {
+      job->flags |= QPL_FLAG_CANNED_MODE;
+      job->huffman_table = GetGlobalCannedHuffmanTable();
     }
 
     // bool use_cxl = config.enabled && (execution_path == qpl_path_pool || execution_path == qpl_path_hardware);
@@ -409,16 +454,6 @@ class IAACompressor : public Compressor {
     if (status != QPL_STS_OK) {
       std::cerr << "[IaaCompressor] Compress: qpl_execute_job failed with status " << status << std::endl;
       return Status::Corruption(QPL_STATUS(status));
-    }
-
-    // After remote CXL IAA completes, the compressed output lives in physical
-    // CXL memory but the CPU cache may hold stale data from a previous
-    // compression that reused the same bounce_dst. Invalidate before reading.
-    if (config.enabled && execution_path == qpl_path_pool) {
-      for (uint32_t i = 0; i < job->total_out; i += 64) {
-        _mm_clflushopt(destination + i);
-      }
-      _mm_mfence();
     }
 
     if (!dst_in_pool && destination == bounce_dst && config.enabled && execution_path == qpl_path_pool) {
@@ -469,37 +504,38 @@ class IAACompressor : public Compressor {
     uint8_t* source =
         const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(input));
     uint8_t* destination = reinterpret_cast<uint8_t*>(*output);
-
     bool src_in_pool = g_cxl_pool_start && source >= g_cxl_pool_start && source < g_cxl_pool_start + g_cxl_pool_size;
     bool dst_in_pool = g_cxl_pool_start && destination >= g_cxl_pool_start && destination < g_cxl_pool_start + g_cxl_pool_size;
     
     thread_local uint8_t* bounce_src = nullptr;
+    thread_local size_t bounce_src_cap = 0;
     thread_local uint8_t* bounce_dst = nullptr;
+    thread_local size_t bounce_dst_cap = 0;
 
     if (!src_in_pool && config.enabled && execution_path == qpl_path_pool) {
-      if (input_length > 4096) {
-        std::cerr << "[QPL CXL] WARNING: Uncompress source buffer bypasses pool and is > 4KB (" << input_length << " bytes)!" << std::endl;
+      if (input_length > bounce_src_cap) {
+        size_t new_cap = std::max(input_length * 2, static_cast<size_t>(65536));
+        bounce_src = (uint8_t*)cxl_mempool_alloc(new_cap);
+        if (bounce_src) bounce_src_cap = new_cap;
       }
-      if (input_length <= 8192) {
-        if (!bounce_src && g_cxl_alloc) bounce_src = (uint8_t*)g_cxl_alloc(8192);
-        if (bounce_src) {
-          std::memcpy(bounce_src, source, input_length);
-          source = bounce_src;
-        }
+      if (bounce_src) {
+        std::memcpy(bounce_src, source, input_length);
+        source = bounce_src;
       }
     }
 
     if (!dst_in_pool && config.enabled && execution_path == qpl_path_pool) {
-      if (encoded_output_length > 4096) {
-        std::cerr << "[QPL CXL] WARNING: Uncompress destination buffer bypasses pool and is > 4KB (" << encoded_output_length << " bytes)!" << std::endl;
+      if (encoded_output_length > bounce_dst_cap) {
+        size_t new_cap = std::max(static_cast<size_t>(encoded_output_length) * 2, static_cast<size_t>(65536));
+        bounce_dst = (uint8_t*)cxl_mempool_alloc(new_cap);
+        if (bounce_dst) bounce_dst_cap = new_cap;
       }
-      if (encoded_output_length <= 8192) {
-        if (!bounce_dst && g_cxl_alloc) bounce_dst = (uint8_t*)g_cxl_alloc(8192);
-        if (bounce_dst) {
-          destination = bounce_dst;
-        }
+      if (bounce_dst) {
+        destination = bounce_dst;
       }
     }
+
+
 
     job->next_in_ptr = source;
     job->available_in = input_length;
@@ -508,6 +544,10 @@ class IAACompressor : public Compressor {
     job->op = qpl_op_decompress;
     job->huffman_table = nullptr;
     job->flags = QPL_FLAG_FIRST | QPL_FLAG_LAST;
+    if (options_.compression_mode == canned_mode) {
+      job->flags |= QPL_FLAG_CANNED_MODE;
+      job->huffman_table = GetGlobalCannedHuffmanTable();
+    }
 
 
     status = QPL_STS_QUEUES_ARE_BUSY_ERR;
@@ -524,14 +564,6 @@ class IAACompressor : public Compressor {
       return Status::Corruption(QPL_STATUS(status));
     } else if (job->total_out != encoded_output_length) {
       return Status::Corruption("size mismatch");
-    }
-
-    // Invalidate CPU cache for destination after remote CXL IAA writes to it
-    if (config.enabled && execution_path == qpl_path_pool) {
-      for (uint32_t i = 0; i < job->total_out; i += 64) {
-        _mm_clflushopt(destination + i);
-      }
-      _mm_mfence();
     }
 
     if (!dst_in_pool && destination == bounce_dst && config.enabled && execution_path == qpl_path_pool) {
